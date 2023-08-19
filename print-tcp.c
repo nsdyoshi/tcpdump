@@ -66,6 +66,8 @@ static int tcp_verify_signature(netdissect_options *ndo,
 static void print_tcp_rst_data(netdissect_options *, const u_char *sp, u_int length);
 static void print_tcp_fastopen_option(netdissect_options *ndo, const u_char *cp,
                                       u_int datalen);
+static int print_tcp_edo_option(netdissect_options *ndo, const u_char *cp, u_int datalen);
+static int parse_edo_option(netdissect_options *ndo, u_int hlen, const struct tcphdr *tp);
 
 #define MAX_RST_DATA_LEN	30
 
@@ -226,6 +228,12 @@ tcp_print(netdissect_options *ndo,
         }
 
         hlen = TH_OFF(tp) * 4;
+        flags = GET_U_1(tp->th_flags);
+
+        /* adjust header length when EDO option presents */
+        if (!(flags & TH_SYN)){
+           hlen = parse_edo_option(ndo, hlen, tp);
+        }
 
         if (hlen < sizeof(*tp)) {
                 ND_PRINT(" tcp %u [bad hdr length %u - too short, < %zu]",
@@ -248,7 +256,6 @@ tcp_print(netdissect_options *ndo,
                 return;
         }
 
-        flags = GET_U_1(tp->th_flags);
         ND_PRINT("Flags [%s]", bittok2str_nosep(tcp_flag_values, "none", flags));
 
         if (!ndo->ndo_Sflag && (flags & TH_ACK)) {
@@ -668,6 +675,11 @@ tcp_print(netdissect_options *ndo,
                                         print_tcp_fastopen_option(ndo, cp + 2, datalen - 2);
                                         break;
 
+                                case 0x0ed0: /* TCP EDO draft-ietf-tcpm-tcp-edo */
+                                        ND_PRINT("edo ");
+                                        uint16_t offset = print_tcp_edo_option(ndo, cp + 2, datalen -2);
+					break;
+
                                 default:
                                         /* Unknown magic number */
                                         ND_PRINT("%04x", magic);
@@ -891,6 +903,23 @@ print_tcp_fastopen_option(netdissect_options *ndo, const u_char *cp,
         }
 }
 
+static int
+print_tcp_edo_option(netdissect_options *ndo, const u_char *cp,
+                          u_int datalen)
+{
+	u_int16_t offset = 0;
+        if (datalen == 0) {
+                /* EDO Supported */
+                ND_PRINT("supported");
+        } else {
+                offset = (GET_BE_U_2(cp) > 60) ? (GET_BE_U_2(cp) - 60):0;
+                ND_PRINT("hlen %u ", GET_BE_U_2(cp));
+		if (datalen == 4)
+                    ND_PRINT("seglen %u ", GET_BE_U_2(cp+2));
+        }
+	return offset;
+}
+
 #ifdef HAVE_LIBCRYPTO
 DIAG_OFF_DEPRECATION
 static int
@@ -974,3 +1003,29 @@ tcp_verify_signature(netdissect_options *ndo,
 }
 DIAG_ON_DEPRECATION
 #endif /* HAVE_LIBCRYPTO */
+
+/* parse EDO option before parsing TCP header to determine correct header length */
+static int
+parse_edo_option(netdissect_options *ndo, u_int hlen, const struct tcphdr *tp)
+{
+        u_int orighlen = hlen, opt, optlen;
+        const u_char *cp;
+        if (hlen > sizeof(*tp)) {
+               cp = (const u_char *)tp + sizeof(*tp);
+	       hlen -= sizeof(*tp);
+               while (hlen > 0) {
+                   opt = GET_U_1(cp);
+		   optlen = (opt > 1) ? GET_U_1(cp+1):1;
+		   /* found EDO option. return new header length */
+		   if ((hlen >= optlen) && (opt == TCPOPT_EXPERIMENT2) && (GET_BE_U_2(cp+2) == 0x0ed0)){
+                       return GET_BE_U_2(cp +4);
+                   }
+
+		   /* parse next option */
+                   hlen -= optlen;
+                   cp += optlen;
+	       }
+        }
+        /* EDO option not found. return original header length */
+        return orighlen;
+}
